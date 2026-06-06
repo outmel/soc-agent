@@ -111,11 +111,9 @@ async function enrichIPAbuse(ip) {
     return null;
   }
 }
-
-
 async function getRunbook(category, context = {}) {
   try {
-    const response = await axios.post('soc-mcp-server-production.up.railway.app', {
+    const response = await axios.post('https://soc-mcp-server-production.up.railway.app/mcp/get_playbook', {
       category,
       context
     });
