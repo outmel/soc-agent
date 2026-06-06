@@ -6,7 +6,6 @@ const OpenAI = require('openai');
 const axios = require('axios');
 const express = require('express');
 
-// Use ExpressReceiver so we can add custom routes on the same port
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET
 });
@@ -53,6 +52,16 @@ const ALERT_SCENARIOS = [
   }
 ];
 
+function getChannelForSeverity(severity) {
+  const map = {
+    P1: process.env.SLACK_CHANNEL_P1,
+    P2: process.env.SLACK_CHANNEL_P2,
+    P3: process.env.SLACK_CHANNEL_P3,
+    P4: process.env.SLACK_CHANNEL_GENERAL
+  };
+  return map[severity] || process.env.SLACK_CHANNEL_ID;
+}
+
 async function enrichIP(ip) {
   try {
     const response = await axios.get(`https://www.virustotal.com/api/v3/ip_addresses/${ip}`, {
@@ -91,9 +100,7 @@ async function enrichIPAbuse(ip) {
         verbose: true
       }
     });
-
     const data = response.data.data;
-
     return {
       abuseScore: data.abuseConfidenceScore,
       totalReports: data.totalReports,
@@ -102,8 +109,6 @@ async function enrichIPAbuse(ip) {
       usageType: data.usageType,
       domain: data.domain,
       isTor: data.isTor,
-      // AbuseIPDB v2: isPublic indicates whether the IP is publicly routable.
-      // Your snippet maps this to isVpn; we keep the same semantics as requested.
       isVpn: data.isPublic
     };
   } catch (err) {
@@ -111,6 +116,7 @@ async function enrichIPAbuse(ip) {
     return null;
   }
 }
+
 async function getRunbook(category, context = {}) {
   try {
     const response = await axios.post('https://soc-mcp-server-production.up.railway.app/mcp/get_playbook', {
@@ -126,7 +132,6 @@ async function getRunbook(category, context = {}) {
 
 async function triageAlert(alert, vtData, abuseData) {
   const prompt = `You are a senior SOC analyst at a Fortune 500 company.
-
 
 ALERT:
 Type: ${alert.type}
@@ -148,7 +153,6 @@ AbuseIPDB:
 - ISP: ${abuseData?.isp || 'unknown'}
 - Usage type: ${abuseData?.usageType || 'unknown'}
 - Tor exit node: ${abuseData?.isTor ? 'YES' : 'NO'}
-
 
 Based on ALL of this context respond in EXACTLY this format:
 SEVERITY: [P1/P2/P3/P4]
@@ -274,16 +278,11 @@ async function processAlert(client, channelId, customAlert = null) {
     const triage = parseTriageResult(rawTriageEnriched);
     const emoji = severityEmoji(triage.severity);
 
-    // Now we have triage + threat intel — pass full context to MCP
+    // Route to correct channel based on severity
+    const targetChannel = getChannelForSeverity(triage.severity);
+
     const runbookData = await getRunbook(triage.category, {
       severity: triage.severity,
-      abuseScore: abuseData?.abuseScore || 0,
-      isTor: abuseData?.isTor || false,
-      usageType: abuseData?.usageType || '',
-      maliciousVT: vtData?.malicious || 0,
-      country: vtData?.country || '',
-      totalReports: abuseData?.totalReports || 0,
-
       sourceIp: scenario.source_ip,
       target: scenario.target,
       abuseScore: abuseData?.abuseScore || 0,
@@ -294,22 +293,38 @@ async function processAlert(client, channelId, customAlert = null) {
       totalReports: abuseData?.totalReports || 0
     });
 
+    // Update placeholder in original channel
     await client.chat.update({
       channel: channelId,
       ts: initial.ts,
+      text: `${emoji} *INCIDENT #${incidentId}* — ${triage.severity} | ${scenario.type} | Routed to ${triage.severity} channel`
+    });
+
+    // Post full incident in severity channel
+    const severityMsg = await client.chat.postMessage({
+      channel: targetChannel,
       text: `${emoji} *INCIDENT #${incidentId}* — ${triage.severity} | ${scenario.type} | 🟡 OPEN`
     });
 
     const threadMsg = await client.chat.postMessage({
-      channel: channelId,
-      thread_ts: initial.ts,
+      channel: targetChannel,
+      thread_ts: severityMsg.ts,
       text: buildThreadText(incidentId, triage, scenario, timestamp, 'open', null, vtData, runbookData, abuseData)
     });
 
-    activeIncidents[initial.ts] = {
-      channelId,
+    // Auto-ping channel for P1
+    if (triage.severity === 'P1') {
+      await client.chat.postMessage({
+        channel: targetChannel,
+        thread_ts: severityMsg.ts,
+        text: `🚨 *P1 CRITICAL* — <!channel> This requires immediate attention. React with 👀 to acknowledge.`
+      });
+    }
+
+    activeIncidents[severityMsg.ts] = {
+      channelId: targetChannel,
       threadTs: threadMsg.ts,
-      parentTs: initial.ts,
+      parentTs: severityMsg.ts,
       scenario,
       triage,
       vtData,
@@ -330,7 +345,6 @@ async function processAlert(client, channelId, customAlert = null) {
   }
 }
 
-// Splunk webhook — same port as Slack
 receiver.app.post('/webhook/splunk', async (req, res) => {
   res.sendStatus(200);
 
@@ -363,7 +377,6 @@ receiver.app.post('/webhook/splunk', async (req, res) => {
   processAlert(app.client, channelId, alert);
 });
 
-// GitHub webhook — same port as Slack
 receiver.app.post('/webhook/github', async (req, res) => {
   res.sendStatus(200);
 
@@ -437,7 +450,7 @@ app.event('reaction_added', async ({ event, client }) => {
       userId,
       incident.vtData,
       incident.runbookData,
-      incident.abuseData  // this was missing
+      incident.abuseData
     )
   });
 
@@ -494,6 +507,10 @@ app.command('/soc-stats', async ({ ack, client, body }) => {
 
 app.command('/simulate-alert', async ({ ack, client, body }) => {
   await ack();
+  await client.chat.postMessage({
+    channel: body.channel_id,
+    text: `🔄 Alert simulation started — routing to severity channel after triage...`
+  });
   processAlert(client, body.channel_id);
 });
 
@@ -502,4 +519,3 @@ app.command('/simulate-alert', async ({ ack, client, body }) => {
   console.log('⚡ SOC Agent running on port 3000');
   console.log('🔗 Webhook routes: /webhook/splunk and /webhook/github');
 })();
-
