@@ -52,7 +52,7 @@ const ALERT_SCENARIOS = [
   }
 ];
 
-function getChannelForSeverity(severity) {
+function  elForSeverity(severity) {
   const map = {
     P1: process.env.SLACK_CHANNEL_P1,
     P2: process.env.SLACK_CHANNEL_P2,
@@ -117,6 +117,46 @@ async function enrichIPAbuse(ip) {
   }
 }
 
+async function findRelatedOffenses(sourceIp, currentIncidentId) {
+  const related = Object.values(activeIncidents).filter(incident =>
+    incident.scenario.source_ip === sourceIp &&
+    incident.incidentId !== currentIncidentId
+  );
+
+  if (related.length === 0) return null;
+
+  // Sort by timestamp, oldest first to show attack progression
+  related.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+  return {
+    count: related.length,
+    incidents: related.map(i => ({
+      id: i.incidentId,
+      type: i.scenario.type,
+      severity: i.triage.severity,
+      target: i.scenario.target,
+      timestamp: i.timestamp,
+      status: i.status
+    }))
+  };
+}
+
+function buildCampaignNarrative(related, currentAlert) {
+  if (!related || related.count === 0) return null;
+
+  const sequence = related.incidents.map(i => i.type).join(' → ') + ` → ${currentAlert.type}`;
+
+  const isEscalating = related.incidents.some(i =>
+    ['Port Scan Detected', 'Reconnaissance'].includes(i.type)
+  ) && ['Brute Force Attempt', 'Data Exfiltration Spike'].includes(currentAlert.type);
+
+  return {
+    sequence,
+    isEscalating,
+    incidentIds: related.incidents.map(i => `#${i.id}`).join(', ')
+  };
+}
+
 async function getRunbook(category, context = {}) {
   try {
     const response = await axios.post('https://soc-mcp-server-production.up.railway.app/mcp/get_playbook', {
@@ -130,7 +170,15 @@ async function getRunbook(category, context = {}) {
   }
 }
 
-async function triageAlert(alert, vtData, abuseData) {
+async function triageAlert(alert, vtData, abuseData, correlationData) {
+  const correlationContext = correlationData
+    ? `\nCORRELATED ACTIVITY:
+This source IP has ${correlationData.count} other recent incident(s) from the same source:
+${correlationData.incidents.map(i => `- ${i.type} targeting ${i.target} (${i.severity}) at ${i.timestamp}`).join('\n')}
+
+This suggests a potential multi-stage attack campaign rather than an isolated event. Factor this into your severity and confidence assessment.`
+    : '';
+
   const prompt = `You are a senior SOC analyst at a Fortune 500 company.
 
 ALERT:
@@ -152,7 +200,7 @@ AbuseIPDB:
 - Last reported: ${abuseData?.lastReported || 'never'}
 - ISP: ${abuseData?.isp || 'unknown'}
 - Usage type: ${abuseData?.usageType || 'unknown'}
-- Tor exit node: ${abuseData?.isTor ? 'YES' : 'NO'}
+- Tor exit node: ${abuseData?.isTor ? 'YES' : 'NO'}${correlationContext}
 
 Based on ALL of this context respond in EXACTLY this format:
 SEVERITY: [P1/P2/P3/P4]
@@ -195,7 +243,7 @@ function severityEmoji(severity) {
   return map[severity] || '⚪';
 }
 
-function buildThreadText(incidentId, triage, scenario, timestamp, status, closedBy, vtData, runbookData, abuseData) {
+function buildThreadText(incidentId, triage, scenario, timestamp, status, closedBy, vtData, runbookData, abuseData, correlationData) {
   const emoji = severityEmoji(triage.severity);
 
   const statusLine = {
@@ -232,6 +280,10 @@ function buildThreadText(incidentId, triage, scenario, timestamp, status, closed
 ${runbookData.playbook.split('\n').map(s => `• ${s}`).join('\n')}\n`
     : '';
 
+  const correlationSection = correlationData && correlationData.count > 0
+    ? `\n🔗 *CORRELATED INCIDENTS DETECTED*\n⚠️ This source IP has ${correlationData.count} other related incident(s) — possible multi-stage attack campaign\n${correlationData.incidents.map(i => `• #${i.id}: ${i.type} → ${i.target} (${i.severity}) at ${i.timestamp} [${i.status}]`).join('\n')}\n`
+    : '';
+
   return `${emoji} *INCIDENT #${incidentId} — ${triage.severity} ${triage.category.toUpperCase()}*
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 *Type:* ${scenario.type}
@@ -239,7 +291,7 @@ ${runbookData.playbook.split('\n').map(s => `• ${s}`).join('\n')}\n`
 *Target:* \`${scenario.target}\`
 *Time:* ${timestamp}
 *Detail:* ${scenario.detail}
-${vtSection}${abuseSection}${runbookSection}
+${vtSection}${abuseSection}${correlationSection}${runbookSection}
 🤖 *AI TRIAGE*
 - Severity: ${triage.severity} ${emoji}
 - Category: ${triage.category}
@@ -274,7 +326,9 @@ async function processAlert(client, channelId, customAlert = null) {
       enrichIPAbuse(scenario.source_ip)
     ]);
 
-    const rawTriageEnriched = await triageAlert(scenario, vtData, abuseData);
+    const correlationData = await findRelatedOffenses(scenario.source_ip, incidentId);
+
+    const rawTriageEnriched = await triageAlert(scenario, vtData, abuseData, correlationData);
     const triage = parseTriageResult(rawTriageEnriched);
     const emoji = severityEmoji(triage.severity);
 
