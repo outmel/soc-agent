@@ -25,6 +25,16 @@ const deepseek = new OpenAI({
 
 const activeIncidents = {};
 
+function getChannelForSeverity(severity) {
+  const map = {
+    P1: process.env.SLACK_CHANNEL_P1,
+    P2: process.env.SLACK_CHANNEL_P2,
+    P3: process.env.SLACK_CHANNEL_P3,
+    P4: process.env.SLACK_CHANNEL_GENERAL
+  };
+  return map[severity] || process.env.SLACK_CHANNEL_ID;
+}
+
 const ALERT_SCENARIOS = [
   {
     type: 'Brute Force Attempt',
@@ -52,7 +62,7 @@ const ALERT_SCENARIOS = [
   }
 ];
 
-function  elForSeverity(severity) {
+function getChannelForSeverity(severity) {
   const map = {
     P1: process.env.SLACK_CHANNEL_P1,
     P2: process.env.SLACK_CHANNEL_P2,
@@ -117,6 +127,19 @@ async function enrichIPAbuse(ip) {
   }
 }
 
+async function getRunbook(category, context = {}) {
+  try {
+    const response = await axios.post('https://soc-mcp-server-production.up.railway.app/mcp/get_playbook', {
+      category,
+      context
+    });
+    return response.data;
+  } catch (err) {
+    console.error('MCP error:', err.message);
+    return null;
+  }
+}
+
 async function findRelatedOffenses(sourceIp, currentIncidentId) {
   const related = Object.values(activeIncidents).filter(incident =>
     incident.scenario.source_ip === sourceIp &&
@@ -125,7 +148,6 @@ async function findRelatedOffenses(sourceIp, currentIncidentId) {
 
   if (related.length === 0) return null;
 
-  // Sort by timestamp, oldest first to show attack progression
   related.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
 
   return {
@@ -139,35 +161,6 @@ async function findRelatedOffenses(sourceIp, currentIncidentId) {
       status: i.status
     }))
   };
-}
-
-function buildCampaignNarrative(related, currentAlert) {
-  if (!related || related.count === 0) return null;
-
-  const sequence = related.incidents.map(i => i.type).join(' → ') + ` → ${currentAlert.type}`;
-
-  const isEscalating = related.incidents.some(i =>
-    ['Port Scan Detected', 'Reconnaissance'].includes(i.type)
-  ) && ['Brute Force Attempt', 'Data Exfiltration Spike'].includes(currentAlert.type);
-
-  return {
-    sequence,
-    isEscalating,
-    incidentIds: related.incidents.map(i => `#${i.id}`).join(', ')
-  };
-}
-
-async function getRunbook(category, context = {}) {
-  try {
-    const response = await axios.post('https://soc-mcp-server-production.up.railway.app/mcp/get_playbook', {
-      category,
-      context
-    });
-    return response.data;
-  } catch (err) {
-    console.error('MCP error:', err.message);
-    return null;
-  }
 }
 
 async function triageAlert(alert, vtData, abuseData, correlationData) {
@@ -200,7 +193,8 @@ AbuseIPDB:
 - Last reported: ${abuseData?.lastReported || 'never'}
 - ISP: ${abuseData?.isp || 'unknown'}
 - Usage type: ${abuseData?.usageType || 'unknown'}
-- Tor exit node: ${abuseData?.isTor ? 'YES' : 'NO'}${correlationContext}
+- Tor exit node: ${abuseData?.isTor ? 'YES' : 'NO'}
+${correlationContext}
 
 Based on ALL of this context respond in EXACTLY this format:
 SEVERITY: [P1/P2/P3/P4]
@@ -273,15 +267,17 @@ function buildThreadText(incidentId, triage, scenario, timestamp, status, closed
 - Tor exit node: ${abuseData.isTor ? '⚠️ YES' : 'No'}\n`
     : '';
 
+  const correlationSection = correlationData && correlationData.count > 0
+    ? `\n🔗 *CORRELATED INCIDENTS DETECTED*
+⚠️ This source IP has ${correlationData.count} other related incident(s) — possible multi-stage attack campaign
+${correlationData.incidents.map(i => `• #${i.id}: ${i.type} → ${i.target} (${i.severity}) at ${i.timestamp} [${i.status}]`).join('\n')}\n`
+    : '';
+
   const runbookSection = runbookData
     ? `\n📖 *MCP RUNBOOK — ${runbookData.category.toUpperCase()}*
 - Owner team: ${runbookData.owner_team}
 - SLA: Respond within ${runbookData.sla_minutes} minutes
 ${runbookData.playbook.split('\n').map(s => `• ${s}`).join('\n')}\n`
-    : '';
-
-  const correlationSection = correlationData && correlationData.count > 0
-    ? `\n🔗 *CORRELATED INCIDENTS DETECTED*\n⚠️ This source IP has ${correlationData.count} other related incident(s) — possible multi-stage attack campaign\n${correlationData.incidents.map(i => `• #${i.id}: ${i.type} → ${i.target} (${i.severity}) at ${i.timestamp} [${i.status}]`).join('\n')}\n`
     : '';
 
   return `${emoji} *INCIDENT #${incidentId} — ${triage.severity} ${triage.category.toUpperCase()}*
@@ -332,7 +328,6 @@ async function processAlert(client, channelId, customAlert = null) {
     const triage = parseTriageResult(rawTriageEnriched);
     const emoji = severityEmoji(triage.severity);
 
-    // Route to correct channel based on severity
     const targetChannel = getChannelForSeverity(triage.severity);
 
     const runbookData = await getRunbook(triage.category, {
@@ -347,26 +342,23 @@ async function processAlert(client, channelId, customAlert = null) {
       totalReports: abuseData?.totalReports || 0
     });
 
-    // Update placeholder in original channel
     await client.chat.update({
       channel: channelId,
       ts: initial.ts,
       text: `${emoji} *INCIDENT #${incidentId}* — ${triage.severity} | ${scenario.type} | Routed to ${triage.severity} channel`
     });
 
-    // Post full incident in severity channel
     const severityMsg = await client.chat.postMessage({
       channel: targetChannel,
-      text: `${emoji} *INCIDENT #${incidentId}* — ${triage.severity} | ${scenario.type} | 🟡 OPEN`
+      text: `${emoji} *INCIDENT #${incidentId}* — ${triage.severity} | ${scenario.type}${correlationData ? ` 🔗 (linked to ${correlationData.count} prior incident${correlationData.count > 1 ? 's' : ''})` : ''} | 🟡 OPEN`
     });
 
     const threadMsg = await client.chat.postMessage({
       channel: targetChannel,
       thread_ts: severityMsg.ts,
-      text: buildThreadText(incidentId, triage, scenario, timestamp, 'open', null, vtData, runbookData, abuseData)
+      text: buildThreadText(incidentId, triage, scenario, timestamp, 'open', null, vtData, runbookData, abuseData, correlationData)
     });
 
-    // Auto-ping channel for P1
     if (triage.severity === 'P1') {
       await client.chat.postMessage({
         channel: targetChannel,
@@ -384,6 +376,7 @@ async function processAlert(client, channelId, customAlert = null) {
       vtData,
       abuseData,
       runbookData,
+      correlationData,
       incidentId,
       timestamp,
       status: 'open'
@@ -504,7 +497,8 @@ app.event('reaction_added', async ({ event, client }) => {
       userId,
       incident.vtData,
       incident.runbookData,
-      incident.abuseData
+      incident.abuseData,
+      incident.correlationData
     )
   });
 
