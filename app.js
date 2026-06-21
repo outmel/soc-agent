@@ -54,20 +54,21 @@ const ALERT_SCENARIOS = [
   }
 ];
 
-function getChannelForSeverity(severity) {
-  const normalized = (severity || '').trim().toUpperCase();
+function getChannelForRoute(route) {
+  const normalized = (route || '').trim().toLowerCase();
   const map = {
-    P1: process.env.SLACK_CHANNEL_P1,
-    P2: process.env.SLACK_CHANNEL_P2,
-    P3: process.env.SLACK_CHANNEL_P3,
-    P4: process.env.SLACK_CHANNEL_GENERAL
+    critical: process.env.SLACK_CHANNEL_P1,
+    high: process.env.SLACK_CHANNEL_P2,
+    low: process.env.SLACK_CHANNEL_P3,
+    general: process.env.SLACK_CHANNEL_GENERAL
   };
+
   const channel = map[normalized] || process.env.SLACK_CHANNEL_ID;
-  
+
   if (!channel) {
-    console.error(`No channel found for severity "${severity}" — check Railway env vars!`);
+    console.error(`No channel found for route "${route}" — check Railway env vars!`);
   }
-  
+
   return channel;
 }
 
@@ -204,7 +205,20 @@ IMMEDIATE_ACTION: [Specific step to take in the next 5 minutes]
 SHORT_TERM_ACTION: [What to do in the next hour]
 LONG_TERM_ACTION: [What to fix to prevent recurrence]
 FALSE_POSITIVE_CHANCE: [percentage with brief reasoning]
-ESCALATE_TO: [which team should be notified]`;
+ESCALATE_TO: [which team should be notified]
+ROUTE: [critical/high/low/general]
+ROUTE_REASON: [1 sentence explaining why this routing destination was chosen]
+
+Notes:
+- ROUTE must reflect actual risk and urgency, not just the SEVERITY label.
+- If ROUTE is critical, the incident requires immediate all-hands attention.
+
+Available routing destinations:
+- critical — immediate, all-hands attention (active breach/high-confidence malicious activity/multi-stage campaign in progress)
+- high — serious incident requiring prompt investigation
+- low — lower-priority anomalies/unconfirmed suspicious activity
+- general — informational/routine/likely false positives`;
+
 
   const response = await deepseek.chat.completions.create({
     model: 'deepseek-chat',
@@ -227,9 +241,12 @@ function parseTriageResult(raw) {
     shortTermAction: get('SHORT_TERM_ACTION'),
     longTermAction: get('LONG_TERM_ACTION'),
     falsePositive: get('FALSE_POSITIVE_CHANCE'),
-    escalateTo: get('ESCALATE_TO')
+    escalateTo: get('ESCALATE_TO'),
+    route: get('ROUTE').toLowerCase(),
+    routeReason: get('ROUTE_REASON')
   };
 }
+
 
 function severityEmoji(severity) {
   const map = { P1: '🔴', P2: '🟠', P3: '🟡', P4: '🟢' };
@@ -293,6 +310,7 @@ ${vtSection}${abuseSection}${correlationSection}${runbookSection}
 - Confidence: ${triage.confidence}
 - False Positive Chance: ${triage.falsePositive}
 - Escalate to: ${triage.escalateTo}
+- 🧭 Routed to: *${(triage.route || 'general').toUpperCase()}* — ${(triage.routeReason || 'No routing reason provided').trim()}
 
 📋 *SUMMARY*
 ${triage.summary}
@@ -360,7 +378,7 @@ async function processAlert(client, channelId, customAlert = null) {
     const triage = parseTriageResult(rawTriageEnriched);
     const emoji = severityEmoji(triage.severity);
 
-    const targetChannel = getChannelForSeverity(triage.severity);
+    const targetChannel = getChannelForRoute(triage.route);
 
     const runbookData = await getRunbook(triage.category, {
       severity: triage.severity,
@@ -377,7 +395,8 @@ async function processAlert(client, channelId, customAlert = null) {
     await client.chat.update({
       channel: channelId,
       ts: initial.ts,
-      text: `${emoji} *INCIDENT #${incidentId}* — ${triage.severity} | ${scenario.type} | Routed to ${triage.severity} channel`
+text: `${emoji} *INCIDENT #${incidentId}* — ${triage.severity} | ${scenario.type} | Routed to ${triage.route.toUpperCase()} channel`
+
     });
 
     const severityMsg = await client.chat.postMessage({
@@ -398,7 +417,7 @@ async function processAlert(client, channelId, customAlert = null) {
       ]
     });
 
-    if (triage.severity === 'P1') {
+    if (triage.route === 'critical') {
       await client.chat.postMessage({
         channel: targetChannel,
         thread_ts: severityMsg.ts,
