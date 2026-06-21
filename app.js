@@ -25,15 +25,7 @@ const deepseek = new OpenAI({
 
 const activeIncidents = {};
 
-function getChannelForSeverity(severity) {
-  const map = {
-    P1: process.env.SLACK_CHANNEL_P1,
-    P2: process.env.SLACK_CHANNEL_P2,
-    P3: process.env.SLACK_CHANNEL_P3,
-    P4: process.env.SLACK_CHANNEL_GENERAL
-  };
-  return map[severity] || process.env.SLACK_CHANNEL_ID;
-}
+
 
 const ALERT_SCENARIOS = [
   {
@@ -63,13 +55,20 @@ const ALERT_SCENARIOS = [
 ];
 
 function getChannelForSeverity(severity) {
+  const normalized = (severity || '').trim().toUpperCase();
   const map = {
     P1: process.env.SLACK_CHANNEL_P1,
     P2: process.env.SLACK_CHANNEL_P2,
     P3: process.env.SLACK_CHANNEL_P3,
     P4: process.env.SLACK_CHANNEL_GENERAL
   };
-  return map[severity] || process.env.SLACK_CHANNEL_ID;
+  const channel = map[normalized] || process.env.SLACK_CHANNEL_ID;
+  
+  if (!channel) {
+    console.error(`No channel found for severity "${severity}" — check Railway env vars!`);
+  }
+  
+  return channel;
 }
 
 async function enrichIP(ip) {
