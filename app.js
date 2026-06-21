@@ -240,7 +240,7 @@ function buildThreadText(incidentId, triage, scenario, timestamp, status, closed
   const emoji = severityEmoji(triage.severity);
 
   const statusLine = {
-    open:   `*Status:* 🟡 OPEN — react with 🔒 to close, 👀 to acknowledge, ❌ for false positive`,
+    open:   `*Status:* 🟡 OPEN`,
     ack:    `*Status:* 👀 ACKNOWLEDGED — being investigated`,
     closed: `*Status:* 🔒 CLOSED — resolved by <@${closedBy}>`,
     fp:     `*Status:* ❌ FALSE POSITIVE — dismissed by <@${closedBy}>`
@@ -305,6 +305,39 @@ ${triage.summary}
 ${statusLine}`;
 }
 
+function buildActionButtons(incidentTs, status) {
+  if (status !== 'open' && status !== 'ack') return [];
+
+  return [
+    {
+      type: 'actions',
+      block_id: `incident_actions_${incidentTs}`,
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '👀 Acknowledge', emoji: true },
+          style: 'primary',
+          action_id: 'incident_ack',
+          value: incidentTs
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '🔒 Close', emoji: true },
+          action_id: 'incident_close',
+          value: incidentTs
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: '❌ False Positive', emoji: true },
+          style: 'danger',
+          action_id: 'incident_fp',
+          value: incidentTs
+        }
+      ]
+    }
+  ];
+}
+
 async function processAlert(client, channelId, customAlert = null) {
   const scenario = customAlert || ALERT_SCENARIOS[Math.floor(Math.random() * ALERT_SCENARIOS.length)];
   const incidentId = Math.floor(Math.random() * 9000) + 1000;
@@ -355,7 +388,14 @@ async function processAlert(client, channelId, customAlert = null) {
     const threadMsg = await client.chat.postMessage({
       channel: targetChannel,
       thread_ts: severityMsg.ts,
-      text: buildThreadText(incidentId, triage, scenario, timestamp, 'open', null, vtData, runbookData, abuseData, correlationData)
+      text: buildThreadText(incidentId, triage, scenario, timestamp, 'open', null, vtData, runbookData, abuseData, correlationData),
+      blocks: [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: buildThreadText(incidentId, triage, scenario, timestamp, 'open', null, vtData, runbookData, abuseData, correlationData) }
+        },
+        ...buildActionButtons(severityMsg.ts, 'open')
+      ]
     });
 
     if (triage.severity === 'P1') {
@@ -454,17 +494,14 @@ receiver.app.post('/webhook/github', async (req, res) => {
   }
 });
 
-app.event('reaction_added', async ({ event, client }) => {
-  const incident = activeIncidents[event.item.ts];
+async function handleIncidentAction(actionId, incidentTs, userId, client) {
+  const incident = activeIncidents[incidentTs];
   if (!incident) return;
 
-  const { reaction } = event;
-  const userId = event.user;
-
   let newStatus = null;
-  if (reaction === 'lock' || reaction === '🔒')       newStatus = 'closed';
-  else if (reaction === 'eyes' || reaction === '👀')  newStatus = 'ack';
-  else if (reaction === 'x' || reaction === '❌')     newStatus = 'fp';
+  if (actionId === 'incident_close') newStatus = 'closed';
+  else if (actionId === 'incident_ack') newStatus = 'ack';
+  else if (actionId === 'incident_fp') newStatus = 'fp';
 
   if (!newStatus) return;
   if (incident.status === newStatus) return;
@@ -484,21 +521,30 @@ app.event('reaction_added', async ({ event, client }) => {
     text: `${emoji} *INCIDENT #${incident.incidentId}* — ${incident.triage.severity} | ${incident.scenario.type} | ${statusLabel}`
   });
 
+  const updatedText = buildThreadText(
+    incident.incidentId,
+    incident.triage,
+    incident.scenario,
+    incident.timestamp,
+    newStatus,
+    userId,
+    incident.vtData,
+    incident.runbookData,
+    incident.abuseData,
+    incident.correlationData
+  );
+
   await client.chat.update({
     channel: incident.channelId,
     ts: incident.threadTs,
-    text: buildThreadText(
-      incident.incidentId,
-      incident.triage,
-      incident.scenario,
-      incident.timestamp,
-      newStatus,
-      userId,
-      incident.vtData,
-      incident.runbookData,
-      incident.abuseData,
-      incident.correlationData
-    )
+    text: updatedText,
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: updatedText }
+      },
+      ...buildActionButtons(incidentTs, newStatus)
+    ]
   });
 
   const statusMessages = {
@@ -512,6 +558,21 @@ app.event('reaction_added', async ({ event, client }) => {
     thread_ts: incident.parentTs,
     text: statusMessages[newStatus]
   });
+}
+
+app.action('incident_ack', async ({ ack, body, client }) => {
+  await ack();
+  await handleIncidentAction('incident_ack', body.actions[0].value, body.user.id, client);
+});
+
+app.action('incident_close', async ({ ack, body, client }) => {
+  await ack();
+  await handleIncidentAction('incident_close', body.actions[0].value, body.user.id, client);
+});
+
+app.action('incident_fp', async ({ ack, body, client }) => {
+  await ack();
+  await handleIncidentAction('incident_fp', body.actions[0].value, body.user.id, client);
 });
 
 app.command('/soc-stats', async ({ ack, client, body }) => {
