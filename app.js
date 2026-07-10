@@ -1,7 +1,7 @@
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
-const { App, ExpressReceiver } = require('@slack/bolt');
+const { App, ExpressReceiver, Assistant } = require('@slack/bolt');
 const { WebClient } = require('@slack/web-api');
 const OpenAI = require('openai');
 const axios = require('axios');
@@ -219,7 +219,8 @@ async function searchPastIncidentsRTS(sourceIp) {
     return incidentMatches.map(m => ({
       id: m.text.match(/INCIDENT #(\d+)/)?.[1] || '?',
       text: m.text,
-      type: m.text.match(/— (.+?) —/)?.[1]?.trim() || 'Unknown',
+      // Parent messages read "*INCIDENT #id* — P1 | <type> | STATUS"
+      type: m.text.match(/\|\s*([^|]+?)\s*\|/)?.[1]?.replace(/\(linked[^)]*\)/, '').trim() || 'Unknown',
       timestamp: new Date(parseFloat(m.ts) * 1000).toISOString().replace('T', ' ').substring(0, 19) + ' UTC',
       channel: m.channel?.name || m.channel?.id,
       permalink: m.permalink,
@@ -1208,6 +1209,98 @@ app.command('/simulate-alert', async ({ ack, client, body }) => {
   processAlert(client, body.channel_id);
 });
 
+// Conversational agent: analysts can ask about incidents in the AI assistant
+// panel, by mentioning the bot in a channel, or via /api/ask. All three share
+// the same answer engine, which grounds DeepSeek in live incident data and
+// pulls Slack history via RTS search when the question references an IP.
+
+function incidentBriefing() {
+  const list = serializeIncidents().slice(0, 20);
+  if (!list.length) return 'No incidents recorded in the current session.';
+  return list.map(i =>
+    `#${i.id} [${i.severity} ${i.status}] ${i.type} — ${i.sourceIp} -> ${i.target}` +
+    ` · risk ${i.riskScore != null ? `${i.riskScore}/100` : 'n/a'} · routed ${i.route}` +
+    `${i.correlatedCount ? ` · ${i.correlatedCount} correlated` : ''} · ${i.timestamp}\n  ${i.summary}`
+  ).join('\n');
+}
+
+async function answerAnalystQuestion(question) {
+  // If the question mentions IPs, pull related history from Slack via RTS
+  const ips = [...new Set(question.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b/g) || [])].slice(0, 2);
+  const rtsSections = [];
+  for (const ip of ips) {
+    const hits = await searchPastIncidentsRTS(ip);
+    if (hits.length) {
+      rtsSections.push(`SLACK HISTORY FOR ${ip} (via Real-Time Search):\n` +
+        hits.slice(0, 5).map(h => `- #${h.id} ${h.type} at ${h.timestamp} in #${h.channel}`).join('\n'));
+    }
+  }
+
+  const prompt = `You are a SOC (Security Operations Center) agent inside Slack. Answer the analyst's question using the live data below. Be concise and factual. Reference incidents by ID like #1001. Format for Slack mrkdwn: *bold*, bullet lists with "-", no markdown headers. If the data does not answer the question, say so plainly rather than guessing.
+
+CURRENT INCIDENTS (newest first):
+${incidentBriefing()}
+${rtsSections.length ? '\n' + rtsSections.join('\n\n') + '\n' : ''}
+QUESTION: ${question}`;
+
+  const response = await deepseek.chat.completions.create({
+    model: 'deepseek-chat',
+    messages: [{ role: 'user', content: prompt }]
+  });
+  return response.choices[0].message.content;
+}
+
+// AI assistant panel (requires the Agents & AI Apps toggle in the app config)
+const assistant = new Assistant({
+  threadStarted: async ({ say, setSuggestedPrompts }) => {
+    await say('SOC agent here. Ask me about open incidents, a specific IP, or the current threat picture.');
+    await setSuggestedPrompts({
+      prompts: [
+        { title: 'Open incidents', message: 'What incidents are currently open and which needs attention first?' },
+        { title: 'Highest risk', message: 'Which incident has the highest risk score, and what is driving it?' },
+        { title: 'Campaign check', message: 'Are any source IPs behind multiple incidents? Summarize the attack chains.' }
+      ]
+    });
+  },
+  userMessage: async ({ message, say, setStatus }) => {
+    const question = (message.text || '').trim();
+    if (!question) return;
+    try {
+      await setStatus('is investigating...');
+      await say(await answerAnalystQuestion(question));
+    } catch (err) {
+      console.error('Assistant error:', err.message);
+      await say(`Sorry, I hit an error answering that: ${err.message}`);
+    }
+  }
+});
+app.assistant(assistant);
+
+// In-channel questions: @mention the bot
+app.event('app_mention', async ({ event, client }) => {
+  const question = (event.text || '').replace(/<@[^>]+>/g, '').trim();
+  const threadTs = event.thread_ts || event.ts;
+  if (!question) {
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: 'Ask me something — e.g. "what do we know about 185.220.101.47?" or "summarize open incidents".'
+    });
+    return;
+  }
+  try {
+    const answer = await answerAnalystQuestion(question);
+    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: answer });
+  } catch (err) {
+    console.error('Mention Q&A error:', err.message);
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: `Could not answer that: ${err.message}`
+    });
+  }
+});
+
 // Web dashboard: live view of session incidents served by Express.
 
 function computeStats(incidents) {
@@ -1313,6 +1406,16 @@ receiver.app.get('/api/stats', requireDashboardToken, (req, res) => {
 
 receiver.app.get('/api/incidents', requireDashboardToken, (req, res) => {
   res.json(serializeIncidents());
+});
+
+receiver.app.get('/api/ask', requireDashboardToken, async (req, res) => {
+  const question = (req.query.q || '').toString().trim();
+  if (!question) return res.status(400).json({ error: 'Missing q parameter' });
+  try {
+    res.json({ question, answer: await answerAnalystQuestion(question) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 receiver.app.get('/', (req, res) => {
