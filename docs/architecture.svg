@@ -1,0 +1,132 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 700" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="700" fill="#ffffff"/>
+  <text x="30" y="42" font-size="22" font-weight="700" fill="#0f172a">SOC Agent — Architecture</text>
+  <text x="30" y="64" font-size="13" fill="#64748b">Alert intake, enrichment, risk scoring, LLM triage, Slack routing, and conversational investigation</text>
+
+  <!-- External intel row -->
+  <text x="330" y="102" font-size="11" fill="#94a3b8" letter-spacing="1">EXTERNAL SERVICES</text>
+  <g font-size="12" fill="#0f172a">
+    <rect x="330" y="112" width="150" height="52" rx="8" fill="#fefce8" stroke="#eab308"/>
+    <text x="405" y="134" text-anchor="middle" font-weight="600">VirusTotal</text>
+    <text x="405" y="151" text-anchor="middle" fill="#64748b" font-size="11">IP reputation</text>
+
+    <rect x="496" y="112" width="150" height="52" rx="8" fill="#fefce8" stroke="#eab308"/>
+    <text x="571" y="134" text-anchor="middle" font-weight="600">AbuseIPDB</text>
+    <text x="571" y="151" text-anchor="middle" fill="#64748b" font-size="11">abuse confidence, Tor</text>
+
+    <rect x="662" y="112" width="150" height="52" rx="8" fill="#fdf2f8" stroke="#db2777"/>
+    <text x="737" y="134" text-anchor="middle" font-weight="600">DeepSeek LLM</text>
+    <text x="737" y="151" text-anchor="middle" fill="#64748b" font-size="11">triage + Q&amp;A</text>
+
+    <rect x="828" y="112" width="170" height="52" rx="8" fill="#f0fdf4" stroke="#16a34a"/>
+    <text x="913" y="134" text-anchor="middle" font-weight="600">MCP Runbook Server</text>
+    <text x="913" y="151" text-anchor="middle" fill="#64748b" font-size="11">get_playbook tool</text>
+  </g>
+
+  <!-- Alert sources -->
+  <text x="30" y="238" font-size="11" fill="#94a3b8" letter-spacing="1">ALERT SOURCES</text>
+  <g font-size="12" fill="#0f172a">
+    <rect x="30" y="248" width="190" height="52" rx="8" fill="#f8fafc" stroke="#94a3b8"/>
+    <text x="125" y="270" text-anchor="middle" font-weight="600">Splunk webhook</text>
+    <text x="125" y="287" text-anchor="middle" fill="#64748b" font-size="11">shared-secret token</text>
+
+    <rect x="30" y="312" width="190" height="52" rx="8" fill="#f8fafc" stroke="#94a3b8"/>
+    <text x="125" y="334" text-anchor="middle" font-weight="600">GitHub webhook</text>
+    <text x="125" y="351" text-anchor="middle" fill="#64748b" font-size="11">HMAC-verified push events</text>
+
+    <rect x="30" y="376" width="190" height="52" rx="8" fill="#f8fafc" stroke="#94a3b8"/>
+    <text x="125" y="398" text-anchor="middle" font-weight="600">/simulate-alert</text>
+    <text x="125" y="415" text-anchor="middle" fill="#64748b" font-size="11">Slack slash command</text>
+  </g>
+
+  <!-- Agent pipeline -->
+  <rect x="290" y="222" width="420" height="290" rx="12" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="310" y="250" font-size="14" font-weight="700" fill="#1d4ed8">SOC Agent</text>
+  <text x="310" y="267" font-size="11" fill="#64748b">Node.js + Bolt + Express, deployed on Railway</text>
+
+  <g font-size="12" fill="#0f172a">
+    <rect x="310" y="282" width="380" height="38" rx="6" fill="#ffffff" stroke="#bfdbfe"/>
+    <text x="322" y="306">1&#160;&#160;Enrich source IP (VirusTotal + AbuseIPDB, parallel)</text>
+
+    <rect x="310" y="326" width="380" height="38" rx="6" fill="#ffffff" stroke="#bfdbfe"/>
+    <text x="322" y="350">2&#160;&#160;Correlate: session store + Slack history via RTS</text>
+
+    <rect x="310" y="370" width="380" height="38" rx="6" fill="#ffffff" stroke="#bfdbfe"/>
+    <text x="322" y="394">3&#160;&#160;Risk score 0&#8211;100 with auditable factors</text>
+
+    <rect x="310" y="414" width="380" height="38" rx="6" fill="#ffffff" stroke="#bfdbfe"/>
+    <text x="322" y="438">4&#160;&#160;LLM triage (JSON) &#8212; score enforces routing floor</text>
+
+    <rect x="310" y="458" width="380" height="38" rx="6" fill="#ffffff" stroke="#bfdbfe"/>
+    <text x="322" y="482">5&#160;&#160;Route to severity channel + runbook + playbook</text>
+  </g>
+
+  <!-- Slack workspace -->
+  <rect x="770" y="222" width="320" height="290" rx="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/>
+  <text x="790" y="250" font-size="14" font-weight="700" fill="#6d28d9">Slack Workspace</text>
+
+  <g font-size="12" fill="#0f172a">
+    <rect x="790" y="264" width="280" height="56" rx="6" fill="#ffffff" stroke="#ddd6fe"/>
+    <text x="802" y="286" font-weight="600">Severity channels</text>
+    <text x="802" y="303" fill="#64748b" font-size="11">#critical&#160;&#160;#high&#160;&#160;#low&#160;&#160;#general</text>
+
+    <rect x="790" y="330" width="280" height="56" rx="6" fill="#ffffff" stroke="#ddd6fe"/>
+    <text x="802" y="352" font-weight="600">Incident cards (Block Kit)</text>
+    <text x="802" y="369" fill="#64748b" font-size="11">Acknowledge / Escalate / Close / FP buttons</text>
+
+    <rect x="790" y="396" width="280" height="56" rx="6" fill="#ffffff" stroke="#ddd6fe"/>
+    <text x="802" y="418" font-weight="600">AI assistant panel + @mentions</text>
+    <text x="802" y="435" fill="#64748b" font-size="11">suggested prompts, grounded Q&amp;A</text>
+
+    <rect x="790" y="452" width="280" height="44" rx="6" fill="#ffffff" stroke="#ddd6fe"/>
+    <text x="802" y="470" font-weight="600">Message history</text>
+    <text x="802" y="486" fill="#64748b" font-size="11">searched via Real-Time Search API</text>
+  </g>
+
+  <!-- Bottom row: persistence + dashboard -->
+  <g font-size="12" fill="#0f172a">
+    <rect x="290" y="560" width="200" height="56" rx="8" fill="#f8fafc" stroke="#94a3b8"/>
+    <text x="390" y="583" text-anchor="middle" font-weight="600">incidents.json</text>
+    <text x="390" y="600" text-anchor="middle" fill="#64748b" font-size="11">persistent store (volume)</text>
+
+    <rect x="510" y="560" width="200" height="56" rx="8" fill="#f8fafc" stroke="#94a3b8"/>
+    <text x="610" y="583" text-anchor="middle" font-weight="600">Live dashboard</text>
+    <text x="610" y="600" text-anchor="middle" fill="#64748b" font-size="11">KPIs, feed, campaigns (token)</text>
+  </g>
+
+  <!-- Arrows: sources -> agent -->
+  <line x1="220" y1="274" x2="290" y2="300" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="220" y1="338" x2="290" y2="350" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <line x1="220" y1="402" x2="290" y2="390" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Arrows: agent <-> external services -->
+  <line x1="420" y1="222" x2="410" y2="164" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <line x1="530" y1="222" x2="565" y2="164" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <line x1="640" y1="222" x2="725" y2="164" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <line x1="700" y1="230" x2="860" y2="164" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+
+  <!-- Arrows: agent <-> slack -->
+  <line x1="710" y1="300" x2="770" y2="296" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowb)"/>
+  <text x="716" y="288" font-size="10" fill="#2563eb">post + route</text>
+  <line x1="770" y1="362" x2="710" y2="366" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowb)"/>
+  <text x="714" y="356" font-size="10" fill="#2563eb">actions</text>
+  <line x1="770" y1="424" x2="710" y2="420" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowb)"/>
+  <text x="712" y="414" font-size="10" fill="#2563eb">questions</text>
+  <line x1="710" y1="474" x2="770" y2="476" stroke="#2563eb" stroke-width="2" marker-end="url(#arrowb)" marker-start="url(#arrowb)"/>
+  <text x="712" y="466" font-size="10" fill="#2563eb">RTS search</text>
+
+  <!-- Arrows: agent -> persistence/dashboard -->
+  <line x1="390" y1="512" x2="390" y2="560" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)" marker-start="url(#arrow)"/>
+  <line x1="560" y1="512" x2="600" y2="560" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <text x="30" y="668" font-size="11" fill="#94a3b8">Slack technologies: Agents &amp; Assistants surface · Real-Time Search API · MCP server integration</text>
+</svg>
