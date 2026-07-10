@@ -1236,7 +1236,14 @@ async function answerAnalystQuestion(question) {
     }
   }
 
-  const prompt = `You are a SOC (Security Operations Center) agent inside Slack. Answer the analyst's question using the live data below. Be concise and factual. Reference incidents by ID like #1001. Format for Slack mrkdwn: *bold*, bullet lists with "-", no markdown headers. If the data does not answer the question, say so plainly rather than guessing.
+  const prompt = `You are a SOC (Security Operations Center) agent inside Slack. Answer the analyst's question using the live data below. Be concise and factual. If the data does not answer the question, say so plainly rather than guessing.
+
+FORMAT RULES (Slack mrkdwn):
+- Start with a one-line direct answer to the question.
+- Follow with short bullets starting with "- ". Bold key facts with single *asterisks*.
+- Put IPs, hostnames and hashes in \`backticks\`. Reference incidents as *#1001*.
+- No markdown headers, no tables, no ** double asterisks.
+- Keep it under 120 words unless the question genuinely needs more.
 
 CURRENT INCIDENTS (newest first):
 ${incidentBriefing()}
@@ -1248,6 +1255,45 @@ QUESTION: ${question}`;
     messages: [{ role: 'user', content: prompt }]
   });
   return response.choices[0].message.content;
+}
+
+// LLMs drift into GitHub-flavored markdown; convert the common cases to
+// Slack mrkdwn so answers don't render with literal ** and ## characters.
+function toSlackMrkdwn(text) {
+  return String(text || '')
+    .replace(/^#{1,6}\s+(.+)$/gm, '*$1*')
+    .replace(/\*\*(.+?)\*\*/g, '*$1*')
+    .replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g, '<$2|$1>')
+    .replace(/^\s*\*\s+/gm, '- ')
+    .trim();
+}
+
+// Wrap an answer in Block Kit: the text split on line boundaries to respect
+// the 3000-char section limit, plus a footer with live context.
+function answerBlocks(answer) {
+  const text = toSlackMrkdwn(answer);
+  const chunks = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    if (current.length + line.length + 1 > 2900) { chunks.push(current); current = line; }
+    else current = current ? `${current}\n${line}` : line;
+  }
+  if (current) chunks.push(current);
+
+  const blocks = chunks.slice(0, 8).map(c => ({
+    type: 'section',
+    text: { type: 'mrkdwn', text: c }
+  }));
+
+  const active = Object.values(activeIncidents).filter(i => i.status === 'open' || i.status === 'ack').length;
+  blocks.push({
+    type: 'context',
+    elements: [{
+      type: 'mrkdwn',
+      text: `Live SOC data · ${active} active incident${active === 1 ? '' : 's'} · <${dashboardUrl()}|Open dashboard>`
+    }]
+  });
+  return blocks;
 }
 
 // AI assistant panel (requires the Agents & AI Apps toggle in the app config)
@@ -1262,12 +1308,14 @@ const assistant = new Assistant({
       ]
     });
   },
-  userMessage: async ({ message, say, setStatus }) => {
+  userMessage: async ({ message, say, setStatus, setTitle }) => {
     const question = (message.text || '').trim();
     if (!question) return;
     try {
       await setStatus('is investigating...');
-      await say(await answerAnalystQuestion(question));
+      await setTitle(question.length > 50 ? `${question.slice(0, 47)}...` : question);
+      const answer = await answerAnalystQuestion(question);
+      await say({ text: toSlackMrkdwn(answer), blocks: answerBlocks(answer) });
     } catch (err) {
       console.error('Assistant error:', err.message);
       await say(`Sorry, I hit an error answering that: ${err.message}`);
@@ -1290,7 +1338,12 @@ app.event('app_mention', async ({ event, client }) => {
   }
   try {
     const answer = await answerAnalystQuestion(question);
-    await client.chat.postMessage({ channel: event.channel, thread_ts: threadTs, text: answer });
+    await client.chat.postMessage({
+      channel: event.channel,
+      thread_ts: threadTs,
+      text: toSlackMrkdwn(answer),
+      blocks: answerBlocks(answer)
+    });
   } catch (err) {
     console.error('Mention Q&A error:', err.message);
     await client.chat.postMessage({
@@ -1412,7 +1465,8 @@ receiver.app.get('/api/ask', requireDashboardToken, async (req, res) => {
   const question = (req.query.q || '').toString().trim();
   if (!question) return res.status(400).json({ error: 'Missing q parameter' });
   try {
-    res.json({ question, answer: await answerAnalystQuestion(question) });
+    const answer = await answerAnalystQuestion(question);
+    res.json({ question, answer: toSlackMrkdwn(answer), blocks: answerBlocks(answer) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
