@@ -296,7 +296,81 @@ async function findRelatedOffenses(sourceIp, currentIncidentId) {
 }
 
 
-async function triageAlert(alert, vtData, abuseData, correlationData) {
+// Deterministic risk scoring (0-100), computed from enrichment signals before
+// the LLM runs. The score gives the model an evidence-based baseline, sets a
+// routing floor (the model can route higher, never lower), and produces a
+// factor breakdown analysts can audit.
+const TYPE_WEIGHTS = [
+  { pattern: /malware|ransom/i,               points: 20, label: 'Malware indicators' },
+  { pattern: /exfil/i,                        points: 20, label: 'Data exfiltration pattern' },
+  { pattern: /brute force/i,                  points: 15, label: 'Brute force pattern' },
+  { pattern: /suspicious file|secret|credential/i, points: 15, label: 'Possible credential exposure' },
+  { pattern: /scan|recon/i,                   points: 10, label: 'Reconnaissance pattern' }
+];
+
+const ASSET_WEIGHTS = [
+  { pattern: /prod|database|\bdb\b/i,   points: 10, label: 'Production or database asset targeted' },
+  { pattern: /finance|payroll|auth/i,   points: 8,  label: 'Sensitive business asset targeted' }
+];
+
+function computeRiskScore(scenario, vtData, abuseData, correlationData) {
+  const factors = [];
+  const add = (points, label) => { if (points > 0) factors.push({ points, label }); };
+
+  const typeMatch = TYPE_WEIGHTS.find(t => t.pattern.test(scenario.type || ''));
+  add(typeMatch ? typeMatch.points : 8, typeMatch ? typeMatch.label : 'Uncategorized alert type');
+
+  const assetMatch = ASSET_WEIGHTS.find(a => a.pattern.test(scenario.target || ''));
+  if (assetMatch) add(assetMatch.points, assetMatch.label);
+
+  if (vtData) {
+    if (vtData.malicious > 0) {
+      add(Math.min(30, 10 + vtData.malicious * 2), `VirusTotal: ${vtData.malicious} engine(s) flag IP as malicious`);
+    } else if (vtData.suspicious > 0) {
+      add(5, `VirusTotal: ${vtData.suspicious} engine(s) flag IP as suspicious`);
+    }
+  }
+
+  if (abuseData) {
+    add(Math.round((abuseData.abuseScore || 0) / 4), `AbuseIPDB confidence ${abuseData.abuseScore}% (${abuseData.totalReports} reports)`);
+    if (abuseData.isTor) add(10, 'Source is a Tor exit node');
+  }
+
+  if (correlationData && correlationData.count > 0) {
+    add(Math.min(25, 10 + correlationData.count * 5), `${correlationData.count} correlated incident(s) from the same IP`);
+  }
+
+  const score = Math.min(100, factors.reduce((sum, f) => sum + f.points, 0));
+  return { score, factors };
+}
+
+// Minimum routing level the evidence demands, regardless of what the LLM says.
+function riskFloorRoute(score) {
+  if (score >= 80) return 'critical';
+  if (score >= 60) return 'high';
+  if (score >= 35) return 'low';
+  return 'general';
+}
+
+// Attach the risk assessment to the triage result and enforce the routing
+// floor. Severity is raised to match the route when the floor kicks in,
+// mirroring how manual escalation keeps the two in sync.
+function applyRiskAssessment(triage, risk) {
+  triage.riskScore = risk.score;
+  triage.riskFactors = risk.factors;
+
+  const floor = riskFloorRoute(risk.score);
+  if (ROUTE_ORDER.indexOf(floor) > ROUTE_ORDER.indexOf(triage.route)) {
+    triage.route = floor;
+    triage.routeReason = `${(triage.routeReason || '').trim()} · Raised to ${floor.toUpperCase()} by risk score ${risk.score}/100`;
+    const sevTarget = ROUTE_SEVERITY[floor];
+    if (sevTarget && (SEVERITY_RANK[sevTarget] || 9) < (SEVERITY_RANK[triage.severity] || 9)) {
+      triage.severity = sevTarget;
+    }
+  }
+}
+
+async function triageAlert(alert, vtData, abuseData, correlationData, risk) {
   const correlationContext = correlationData
     ? `\nCORRELATED ACTIVITY:
 This source IP has ${correlationData.count} other recent incident(s) from the same source:
@@ -328,6 +402,10 @@ AbuseIPDB:
 - Usage type: ${abuseData?.usageType || 'unknown'}
 - Tor exit node: ${abuseData?.isTor ? 'YES' : 'NO'}
 ${correlationContext}
+
+DETERMINISTIC RISK SCORE: ${risk.score}/100, computed from the signals above:
+${risk.factors.map(f => `- ${f.label} (+${f.points})`).join('\n')}
+Use this score as your baseline for severity and routing. Deviate only when the evidence justifies it, and explain why in route_reason.
 
 Based on ALL of this context respond with a single JSON object using exactly these keys:
 {
@@ -442,6 +520,7 @@ function buildIncidentBlocks(incidentId, triage, scenario, timestamp, status, cl
       elements: [
         { type: 'mrkdwn', text: `*${triage.severity} ${sev.label}*` },
         { type: 'mrkdwn', text: statusBadge },
+        ...(triage.riskScore != null ? [{ type: 'mrkdwn', text: `Risk ${triage.riskScore}/100` }] : []),
         { type: 'mrkdwn', text: timestamp }
       ]
     },
@@ -497,6 +576,17 @@ function buildIncidentBlocks(incidentId, triage, scenario, timestamp, status, cl
   }
   if (intelFields.length) {
     blocks.push({ type: 'section', fields: intelFields });
+  }
+
+  // Risk score breakdown — the auditable "why" behind severity and routing
+  if (triage.riskScore != null && Array.isArray(triage.riskFactors) && triage.riskFactors.length) {
+    blocks.push({
+      type: 'context',
+      elements: [{
+        type: 'mrkdwn',
+        text: `*Risk score ${triage.riskScore}/100* — ${triage.riskFactors.map(f => `${f.label} (+${f.points})`).join(' · ')}`
+      }]
+    });
   }
 
   // Correlation — highlight potential multi-stage campaigns
@@ -593,13 +683,18 @@ ${correlationData.incidents.map(i => `- #${i.id}: ${i.type} → ${i.target} (${i
 ${runbookData.playbook.split('\n').map(s => `- ${s}`).join('\n')}\n`
     : '';
 
+  const riskSection = triage.riskScore != null
+    ? `\n*RISK SCORE — ${triage.riskScore}/100*
+${(triage.riskFactors || []).map(f => `- ${f.label} (+${f.points})`).join('\n')}\n`
+    : '';
+
   return `*INCIDENT #${incidentId} — ${triage.severity} ${triage.category.toUpperCase()}*
 *Type:* ${scenario.type}
 *Source:* \`${scenario.source_ip}\`
 *Target:* \`${scenario.target}\`
 *Time:* ${timestamp}
 *Detail:* ${scenario.detail}
-${vtSection}${abuseSection}${correlationSection}${runbookSection}
+${vtSection}${abuseSection}${correlationSection}${riskSection}${runbookSection}
 *AI TRIAGE*
 - Severity: ${triage.severity}
 - Category: ${triage.category}
@@ -691,9 +786,11 @@ async function processAlert(client, channelId, customAlert = null) {
     ]);
 
     const correlationData = await findRelatedOffenses(scenario.source_ip, incidentId);
+    const risk = computeRiskScore(scenario, vtData, abuseData, correlationData);
 
-    const rawTriageEnriched = await triageAlert(scenario, vtData, abuseData, correlationData);
+    const rawTriageEnriched = await triageAlert(scenario, vtData, abuseData, correlationData, risk);
     const triage = parseTriageResult(rawTriageEnriched);
+    applyRiskAssessment(triage, risk);
 
     const targetChannel = getChannelForRoute(triage.route);
 
@@ -1179,6 +1276,8 @@ function serializeIncidents() {
       longTermAction: i.triage.longTermAction,
       status: i.status,
       timestamp: i.timestamp,
+      riskScore: i.triage.riskScore != null ? i.triage.riskScore : null,
+      riskFactors: i.triage.riskFactors || [],
       abuseScore: i.abuseData ? i.abuseData.abuseScore : null,
       totalReports: i.abuseData ? i.abuseData.totalReports : null,
       isp: i.abuseData ? i.abuseData.isp : null,
@@ -1440,12 +1539,18 @@ const DASHBOARD_HTML = `<!doctype html>
         '<p class="dim"><b>Analyst confidence:</b> ' + esc(i.confidence) + ' · <b>Escalate to:</b> ' + esc(i.escalateTo) + '</p>' +
       '</div>';
 
+    const riskDetail = (i.riskScore != null)
+      ? '<div class="dsec"><div class="dtitle">Risk Score — ' + esc(i.riskScore) + '/100</div>' +
+          '<ul class="steps">' + (i.riskFactors || []).map(f => '<li>' + esc(f.label) + ' <b>+' + esc(f.points) + '</b></li>').join('') + '</ul>' +
+        '</div>'
+      : '';
+
     const runbook = i.runbook
       ? '<div class="dsec"><div class="dtitle">Runbook — ' + esc(i.runbook.category) + ' · ' + esc(i.runbook.team) + ' · SLA ' + esc(i.runbook.sla) + 'm</div>' +
           '<ul class="steps">' + i.runbook.steps.map(s => '<li>' + esc(s) + '</li>').join('') + '</ul></div>'
       : '';
 
-    return '<div class="detail">' + narrative + blast + timeline + playbook + intel + runbook + '</div>';
+    return '<div class="detail">' + narrative + blast + timeline + playbook + intel + riskDetail + runbook + '</div>';
   }
 
   function cardHTML(i) {
@@ -1454,6 +1559,7 @@ const DASHBOARD_HTML = `<!doctype html>
     const corr = i.correlatedCount > 0 ? '<span class="badge corr">' + i.correlatedCount + ' linked</span>' : '';
     const vt = (i.vtMalicious != null) ? '<span>VT <b>' + i.vtMalicious + '/' + i.vtTotal + '</b></span>' : '';
     const abuse = (i.abuseScore != null) ? '<span>Abuse <b>' + i.abuseScore + '%</b></span>' : '';
+    const riskMeta = (i.riskScore != null) ? '<span>RISK <b>' + i.riskScore + '/100</b></span>' : '';
     return '<div class="card' + (isOpen ? ' open' : '') + '" data-ts="' + esc(i.ts) + '">' +
       '<div class="bar" style="background:' + sev.c + '"></div>' +
       '<div class="card-body">' +
@@ -1470,7 +1576,7 @@ const DASHBOARD_HTML = `<!doctype html>
           '<span>SRC <b>' + esc(i.sourceIp) + '</b></span>' +
           '<span>DST <b>' + esc(i.target) + '</b></span>' +
           (i.country ? '<span>GEO <b>' + esc(i.country) + '</b></span>' : '') +
-          vt + abuse +
+          vt + abuse + riskMeta +
           '<span>ROUTE <b>' + esc((i.route||'general').toUpperCase()) + '</b></span>' +
           '<span class="ml">' + esc(i.timestamp) + '</span>' +
         '</div>' +
