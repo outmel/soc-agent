@@ -1534,7 +1534,6 @@ const DASHBOARD_HTML = `<!doctype html>
   .meta b { color: var(--txt); font-weight: 500; }
   .ml { margin-left: auto; }
   .empty { text-align: center; color: var(--muted); padding: 60px 20px; border: 1px dashed var(--border); border-radius: 12px; font-family: var(--mono); }
-  footer { text-align:center; color: var(--muted); font-size: 11px; margin-top: 28px; font-family: var(--mono); }
 
   /* Expandable incident detail */
   .card { cursor: pointer; transition: border-color .15s; }
@@ -1594,8 +1593,6 @@ const DASHBOARD_HTML = `<!doctype html>
       <button class="tab" data-view="campaigns" id="tab-campaigns">Campaigns</button>
     </div>
     <div class="cards" id="feed"></div>
-
-    <footer>SOC Agent — session-scoped in-memory feed. Incidents reset on restart.</footer>
   </div>
 
 <script>
