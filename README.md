@@ -60,6 +60,55 @@ Copy `.env.example` to `.env` and fill it in. The app needs:
 
 Slack app configuration: enable **Agents & AI Apps**, subscribe to the `assistant_thread_started`, `assistant_thread_context_changed`, `message.im`, and `app_mention` bot events at `/slack/events`, and grant the scopes listed in `.env.example`. Slash commands: `/simulate-alert`, `/soc-stats`.
 
+## Field guide: what the agent produces and why
+
+Every incident goes through the same investigation the analyst would have done by hand. The card is laid out in the order an analyst thinks: what happened, how bad is it, what does the evidence say, have we seen this attacker before, and what do we do about it.
+
+### The Slack incident card
+
+**Header and status banner** — `INCIDENT #1002 · P1 BRUTE FORCE` plus a banner with the severity label (`P1 CRITICAL`), lifecycle status (`OPEN`, `ACKNOWLEDGED`, `CLOSED`, `FALSE POSITIVE` — with who actioned it), the risk score (`Risk 100/100`), and the detection timestamp.
+
+**Key facts** — the raw alert, normalized:
+- *Type* — the detection category from the source system (Brute Force Attempt, Data Exfiltration Spike, Port Scan, Malware Hash, Suspicious File Push).
+- *Source IP / Target* — attacker address and the asset it touched. These two fields drive everything downstream: the IP is what gets enriched and correlated, the target is what feeds blast-radius and asset-criticality scoring.
+- *Confidence* — the model's confidence in its own triage (High/Medium/Low).
+- *Escalate to* — which team the AI thinks should own the response.
+- *Channel routed* — where the incident landed (CRITICAL/HIGH/LOW/GENERAL).
+- *Detail* — the original event text from Splunk/GitHub, unmodified, so the analyst always sees the ground truth.
+
+**Routing Decision** — one sentence of reasoning for why this incident went to this channel. If the deterministic risk floor overrode the model, that is stated here too (`Raised to CRITICAL by risk score 100/100`), so routing is never a black box.
+
+**False-Positive Likelihood** — a percentage with reasoning. This is deliberately separate from severity: an alert can be technically severe but probably benign (an internal scanner tripping brute-force rules), and the agent says so.
+
+**Threat Intelligence** — the enrichment results, fetched live at alert time:
+- *VirusTotal* — how many of ~90 AV engines flag the source IP as malicious, plus country and network owner. This answers "is this IP known-bad globally?"
+- *AbuseIPDB* — community abuse confidence (0–100%), total abuse reports, and whether the IP is a Tor exit node. This answers "is this IP actively abusive right now?"
+
+**Risk score breakdown** — the deterministic 0–100 score with every contributing factor and its points, e.g. `Brute force pattern (+15) · Production or database asset targeted (+10) · VirusTotal: 14 engines flag IP as malicious (+30) · AbuseIPDB confidence 100% (+25) · Source is a Tor exit node (+10) · 4 correlated incidents from the same IP (+25)`. This is the auditable half of the hybrid scoring: an analyst can dispute any line of it, and it acts as a floor under the LLM's routing.
+
+**Correlated incidents** — the agent's memory. Before triage, it looks for other incidents from the same source IP in two places: the current incident store, and the workspace's own message history via Slack's Real-Time Search API (which is how correlation survives restarts and redeploys). Each hit is listed with its ID, type, target, severity, and status. Multiple hits reframe the incident from "an event" to "a stage in a campaign", and the AI's severity assessment is explicitly told about them.
+
+**Runbook** — fetched from the MCP server by category: owning team, response SLA in minutes, and the step-by-step procedure. Response knowledge stays centralized on the MCP server instead of being hardcoded into the bot.
+
+**AI Triage Summary** — two or three sentences of narrative synthesis: what is happening, in the context of the enrichment and correlations, and why it matters.
+
+**Response Playbook** — three time-boxed actions: *Now (5 min)* contain, *Soon (1 hr)* investigate, *Prevent* fix the root cause. Generated per-incident from the full evidence, not from a template.
+
+**Action buttons** — *Acknowledge* (analyst takes ownership), *Escalate* (moves the incident one channel up, re-posts it there, retires the old thread, and raises severity to match — with a confirmation dialog), *Close* (resolved), *False Positive* (dismissed). Every click updates the card, posts an audit message to the thread, and lands in the incident's timeline.
+
+### The dashboard
+
+**KPI tiles** — totals at a glance: incident count (with how many are correlated), the P1–P4 severity split, open/acknowledged counts, resolution rate, and false-positive rate with the top threat category.
+
+**Incident Feed** — one card per incident: severity color bar, type, status, linked-incident badge, the AI summary, and a metadata row (source, destination, geo, VirusTotal ratio, abuse confidence, risk score, route, time). Click to expand:
+
+- **Attack Narrative** — the alert detail plus, when correlations exist, an explicit statement that this is not an isolated event, followed by the routing reasoning and false-positive assessment.
+- **Blast Radius** — every asset touched by this source IP across *all* of its correlated incidents (not just this one), the teams pulled into the response, and the attacker's origin (country, ISP, Tor status). This turns "one alert, one host" into the actual footprint of the attacker.
+- **Timeline** — the attack reconstructed in order: prior incidents from the same IP first (each marked with whether it came from this session or was found in Slack history), then this incident's lifecycle events — created, acknowledged, escalated (with severity change and analyst), closed or dismissed — each timestamped and attributed.
+- **Response Playbook / Threat Intel / Risk Score / Runbook** — the same evidence as the Slack card, kept side-by-side so the dashboard stands alone during a review.
+
+**Campaigns view** — the feed regrouped by attacker. Any source IP with more than one incident becomes a campaign block: worst severity, incident count, how many are still active, the *attack chain* (the sequence of categories, e.g. `Reconnaissance → Brute Force → Data Exfiltration`), and the combined blast radius. The incidents inside are ordered oldest-first so the block reads as the story of the attack. Isolated one-off incidents are listed separately below.
+
 ## Deployment
 
 The live instance runs on Railway and auto-deploys from this repo's `main` branch. Any Node host works: set the environment variables above, make sure the platform's assigned `PORT` is used (Railway injects it), and mount a persistent volume for `DATA_DIR` if incidents should survive redeploys. Point every Slack request URL (slash commands, event subscriptions, interactivity) at `https://<your-domain>/slack/events`, and remember Splunk 9+ requires the webhook URL to be added to its webhook allow list.
