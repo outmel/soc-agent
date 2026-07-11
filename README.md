@@ -60,6 +60,10 @@ Copy `.env.example` to `.env` and fill it in. The app needs:
 
 Slack app configuration: enable **Agents & AI Apps**, subscribe to the `assistant_thread_started`, `assistant_thread_context_changed`, `message.im`, and `app_mention` bot events at `/slack/events`, and grant the scopes listed in `.env.example`. Slash commands: `/simulate-alert`, `/soc-stats`.
 
+## Deployment
+
+The live instance runs on Railway and auto-deploys from this repo's `main` branch. Any Node host works: set the environment variables above, make sure the platform's assigned `PORT` is used (Railway injects it), and mount a persistent volume for `DATA_DIR` if incidents should survive redeploys. Point every Slack request URL (slash commands, event subscriptions, interactivity) at `https://<your-domain>/slack/events`, and remember Splunk 9+ requires the webhook URL to be added to its webhook allow list.
+
 ## Demo walkthrough
 
 1. Run `/simulate-alert` — watch the alert get enriched, scored, and routed to a severity channel within seconds.
